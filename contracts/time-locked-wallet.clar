@@ -6,6 +6,11 @@
 (define-constant err-insufficient-balance (err u104))
 (define-constant err-invalid-unlock-height (err u105))
 (define-constant err-unauthorized (err u106))
+(define-constant err-guardian-exists (err u107))
+(define-constant err-not-guardian (err u108))
+(define-constant err-owner-still-active (err u109))
+(define-constant err-recovery-not-ready (err u110))
+(define-constant err-recovery-already-initiated (err u111))
 
 (define-map wallets
   { wallet-id: uint }
@@ -13,13 +18,25 @@
     owner: principal,
     balance: uint,
     unlock-height: uint,
-    created-at: uint
+    created-at: uint,
+    last-activity: uint,
+    recovery-delay: uint
   }
 )
 
 (define-map user-wallets
   { user: principal }
   { wallet-count: uint }
+)
+
+(define-map recovery-guardians
+  { wallet-id: uint, guardian: principal }
+  { authorized-at: uint, is-active: bool }
+)
+
+(define-map recovery-requests
+  { wallet-id: uint }
+  { guardian: principal, initiated-at: uint, recovery-delay: uint }
 )
 
 (define-data-var next-wallet-id uint u1)
@@ -38,7 +55,9 @@
         owner: tx-sender,
         balance: u0,
         unlock-height: unlock-height,
-        created-at: current-height
+        created-at: current-height,
+        last-activity: current-height,
+        recovery-delay: u10080
       }
     )
     
@@ -63,7 +82,10 @@
     
     (map-set wallets
       { wallet-id: wallet-id }
-      (merge wallet { balance: (+ (get balance wallet) amount) })
+      (merge wallet { 
+        balance: (+ (get balance wallet) amount),
+        last-activity: stacks-block-height
+      })
     )
     
     (ok amount)
@@ -84,7 +106,10 @@
     
     (map-set wallets
       { wallet-id: wallet-id }
-      (merge wallet { balance: (- (get balance wallet) amount) })
+      (merge wallet { 
+        balance: (- (get balance wallet) amount),
+        last-activity: stacks-block-height
+      })
     )
     
     (ok amount)
@@ -105,7 +130,10 @@
     
     (map-set wallets
       { wallet-id: wallet-id }
-      (merge wallet { balance: u0 })
+      (merge wallet { 
+        balance: u0,
+        last-activity: stacks-block-height
+      })
     )
     
     (ok balance)
@@ -123,10 +151,119 @@
     
     (map-set wallets
       { wallet-id: wallet-id }
-      (merge wallet { unlock-height: new-unlock-height })
+      (merge wallet { 
+        unlock-height: new-unlock-height,
+        last-activity: stacks-block-height
+      })
     )
     
     (ok new-unlock-height)
+  )
+)
+
+(define-public (set-recovery-guardian (wallet-id uint) (guardian principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (is-none (map-get? recovery-guardians { wallet-id: wallet-id, guardian: guardian })) err-guardian-exists)
+    
+    (map-set recovery-guardians
+      { wallet-id: wallet-id, guardian: guardian }
+      { authorized-at: stacks-block-height, is-active: true }
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: stacks-block-height })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-recovery-guardian (wallet-id uint) (guardian principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (is-some (map-get? recovery-guardians { wallet-id: wallet-id, guardian: guardian })) err-not-found)
+    
+    (map-delete recovery-guardians { wallet-id: wallet-id, guardian: guardian })
+    (map-delete recovery-requests { wallet-id: wallet-id })
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: stacks-block-height })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (initiate-emergency-recovery (wallet-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (guardian-info (unwrap! (map-get? recovery-guardians { wallet-id: wallet-id, guardian: tx-sender }) err-not-guardian))
+    (inactivity-period (- stacks-block-height (get last-activity wallet)))
+  )
+    (asserts! (get is-active guardian-info) err-not-guardian)
+    (asserts! (>= inactivity-period (get recovery-delay wallet)) err-owner-still-active)
+    (asserts! (is-none (map-get? recovery-requests { wallet-id: wallet-id })) err-recovery-already-initiated)
+    
+    (map-set recovery-requests
+      { wallet-id: wallet-id }
+      { 
+        guardian: tx-sender,
+        initiated-at: stacks-block-height,
+        recovery-delay: u1440
+      }
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (execute-emergency-recovery (wallet-id uint) (recovery-address principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (recovery-request (unwrap! (map-get? recovery-requests { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+    (recovery-ready (>= (- current-height (get initiated-at recovery-request)) (get recovery-delay recovery-request)))
+    (wallet-balance (get balance wallet))
+  )
+    (asserts! (is-eq (get guardian recovery-request) tx-sender) err-unauthorized)
+    (asserts! recovery-ready err-recovery-not-ready)
+    (asserts! (> wallet-balance u0) err-insufficient-balance)
+    
+    (try! (as-contract (stx-transfer? wallet-balance tx-sender recovery-address)))
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { balance: u0 })
+    )
+    
+    (map-delete recovery-requests { wallet-id: wallet-id })
+    
+    (ok wallet-balance)
+  )
+)
+
+(define-public (cancel-recovery-request (wallet-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (is-some (map-get? recovery-requests { wallet-id: wallet-id })) err-not-found)
+    
+    (map-delete recovery-requests { wallet-id: wallet-id })
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: stacks-block-height })
+    )
+    
+    (ok true)
   )
 )
 
@@ -198,6 +335,46 @@
 
 (define-read-only (get-contract-balance)
   (stx-get-balance (as-contract tx-sender))
+)
+
+(define-read-only (get-recovery-guardian (wallet-id uint) (guardian principal))
+  (map-get? recovery-guardians { wallet-id: wallet-id, guardian: guardian })
+)
+
+(define-read-only (get-recovery-request (wallet-id uint))
+  (map-get? recovery-requests { wallet-id: wallet-id })
+)
+
+(define-read-only (is-recovery-ready (wallet-id uint))
+  (match (map-get? recovery-requests { wallet-id: wallet-id })
+    request (>= (- stacks-block-height (get initiated-at request)) (get recovery-delay request))
+    false
+  )
+)
+
+(define-read-only (get-owner-inactivity-period (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet (- stacks-block-height (get last-activity wallet))
+    u0
+  )
+)
+
+(define-read-only (can-initiate-recovery (wallet-id uint) (guardian principal))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (let (
+        (guardian-info (map-get? recovery-guardians { wallet-id: wallet-id, guardian: guardian }))
+        (inactivity-period (- stacks-block-height (get last-activity wallet)))
+      )
+        (and 
+          (is-some guardian-info)
+          (get is-active (unwrap-panic guardian-info))
+          (>= inactivity-period (get recovery-delay wallet))
+          (is-none (map-get? recovery-requests { wallet-id: wallet-id }))
+        )
+      )
+    false
+  )
 )
 
 (define-read-only (is-wallet-owner (wallet-id uint) (user principal))
