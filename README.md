@@ -11,6 +11,41 @@ A Clarity smart contract that allows users to create time-locked wallets where f
 - 📈 **Extend Lock Period**: Extend the lock time for additional security
 - 🗑️ **Cleanup**: Delete empty wallets to keep things tidy
 
+## 🤝 Multi-Signature Co-Ownership System
+
+Transforms time-locked wallets into collaborative financial instruments with multi-signature approval workflows, enabling shared ownership and governance for business accounts, family savings, and joint ventures.
+
+### ✨ Core Capabilities
+- **Shared Ownership**: Multiple co-owners can manage wallet operations together
+- **Configurable Thresholds**: Set custom approval requirements (1-20 co-owners)
+- **Proposal System**: Any co-owner can propose withdrawal operations
+- **Approval Workflow**: Transparent voting mechanism with execution gates
+
+### 🔧 Multisig Operations
+1. **Wallet Creation**: `create-multisig-wallet` with approval threshold
+2. **Owner Management**: `add-co-owner`/`remove-co-owner` for access control
+3. **Operation Proposals**: `propose-withdrawal` initiates approval process
+4. **Approval Collection**: `approve-operation` gathers required signatures
+5. **Execution**: `execute-multisig-withdrawal` completes approved operations
+
+### 🛡️ Security Framework
+- **Threshold Validation**: Prevents unsafe approval configurations
+- **Double-Vote Prevention**: Approval tracking blocks duplicate signatures
+- **Activity Integration**: Multisig operations update wallet activity
+- **Permission Controls**: Owner-only management with co-owner operation rights
+
+### 🎯 Enterprise Applications
+- **Business Accounts**: Shared treasury management with corporate governance
+- **Family Savings**: Joint financial planning with spousal approval requirements
+- **Investment Groups**: Collective fund management with member consensus
+- **Partnership Funds**: Multi-party approval for business expenditures
+
+### 📊 Technical Features
+- **Backwards Compatible**: Existing single-owner wallets remain unchanged
+- **Scalable Design**: Supports up to 20 co-owners per wallet
+- **Operation Tracking**: Comprehensive approval and execution logging
+- **Read-Only Functions**: Complete visibility into multisig status and approvals
+
 ## 🚀 Quick Start
 
 ### Creating a Wallet
