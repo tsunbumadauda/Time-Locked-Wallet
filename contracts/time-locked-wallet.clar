@@ -11,6 +11,11 @@
 (define-constant err-owner-still-active (err u109))
 (define-constant err-recovery-not-ready (err u110))
 (define-constant err-recovery-already-initiated (err u111))
+(define-constant err-insufficient-approvals (err u112))
+(define-constant err-already-approved (err u113))
+(define-constant err-not-co-owner (err u114))
+(define-constant err-invalid-threshold (err u115))
+(define-constant err-cannot-remove-self (err u116))
 
 (define-map wallets
   { wallet-id: uint }
@@ -20,7 +25,10 @@
     unlock-height: uint,
     created-at: uint,
     last-activity: uint,
-    recovery-delay: uint
+    recovery-delay: uint,
+    is-multisig: bool,
+    approval-threshold: uint,
+    total-owners: uint
   }
 )
 
@@ -39,7 +47,18 @@
   { guardian: principal, initiated-at: uint, recovery-delay: uint }
 )
 
+(define-map wallet-co-owners
+  { wallet-id: uint, owner: principal }
+  { added-at: uint, is-active: bool }
+)
+
+(define-map pending-approvals
+  { wallet-id: uint, operation-id: uint }
+  { operation-type: (string-ascii 20), target-amount: uint, approvals: (list 20 principal), created-at: uint }
+)
+
 (define-data-var next-wallet-id uint u1)
+(define-data-var next-operation-id uint u1)
 
 (define-public (create-wallet (unlock-height uint))
   (let (
@@ -57,7 +76,10 @@
         unlock-height: unlock-height,
         created-at: current-height,
         last-activity: current-height,
-        recovery-delay: u10080
+        recovery-delay: u10080,
+        is-multisig: false,
+        approval-threshold: u1,
+        total-owners: u1
       }
     )
     
@@ -76,7 +98,7 @@
     (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
   )
     (asserts! (> amount u0) err-insufficient-balance)
-    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (or (is-eq (get owner wallet) tx-sender) (is-co-owner wallet-id tx-sender)) err-unauthorized)
     
     (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
     
@@ -267,6 +289,174 @@
   )
 )
 
+(define-public (create-multisig-wallet (unlock-height uint) (approval-threshold uint))
+  (let (
+    (wallet-id (var-get next-wallet-id))
+    (current-height stacks-block-height)
+  )
+    (asserts! (> unlock-height current-height) err-invalid-unlock-height)
+    (asserts! (> approval-threshold u0) err-invalid-threshold)
+    (asserts! (<= approval-threshold u20) err-invalid-threshold)
+    (asserts! (is-none (map-get? wallets { wallet-id: wallet-id })) err-already-exists)
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      {
+        owner: tx-sender,
+        balance: u0,
+        unlock-height: unlock-height,
+        created-at: current-height,
+        last-activity: current-height,
+        recovery-delay: u10080,
+        is-multisig: true,
+        approval-threshold: approval-threshold,
+        total-owners: u1
+      }
+    )
+    
+    (map-set wallet-co-owners
+      { wallet-id: wallet-id, owner: tx-sender }
+      { added-at: current-height, is-active: true }
+    )
+    
+    (map-set user-wallets
+      { user: tx-sender }
+      { wallet-count: (+ (get-user-wallet-count tx-sender) u1) }
+    )
+    
+    (var-set next-wallet-id (+ wallet-id u1))
+    (ok wallet-id)
+  )
+)
+
+(define-public (add-co-owner (wallet-id uint) (new-owner principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (get is-multisig wallet) err-unauthorized)
+    (asserts! (< (get total-owners wallet) u20) err-invalid-threshold)
+    (asserts! (is-none (map-get? wallet-co-owners { wallet-id: wallet-id, owner: new-owner })) err-already-exists)
+    
+    (map-set wallet-co-owners
+      { wallet-id: wallet-id, owner: new-owner }
+      { added-at: stacks-block-height, is-active: true }
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { 
+        total-owners: (+ (get total-owners wallet) u1),
+        last-activity: stacks-block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (remove-co-owner (wallet-id uint) (remove-owner principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (get is-multisig wallet) err-unauthorized)
+    (asserts! (not (is-eq remove-owner tx-sender)) err-cannot-remove-self)
+    (asserts! (is-some (map-get? wallet-co-owners { wallet-id: wallet-id, owner: remove-owner })) err-not-found)
+    (asserts! (> (get total-owners wallet) (get approval-threshold wallet)) err-invalid-threshold)
+    
+    (map-delete wallet-co-owners { wallet-id: wallet-id, owner: remove-owner })
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { 
+        total-owners: (- (get total-owners wallet) u1),
+        last-activity: stacks-block-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (propose-withdrawal (wallet-id uint) (amount uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (operation-id (var-get next-operation-id))
+  )
+    (asserts! (get is-multisig wallet) err-unauthorized)
+    (asserts! (or (is-eq (get owner wallet) tx-sender) (is-co-owner wallet-id tx-sender)) err-unauthorized)
+    (asserts! (> amount u0) err-insufficient-balance)
+    (asserts! (>= (get balance wallet) amount) err-insufficient-balance)
+    
+    (map-set pending-approvals
+      { wallet-id: wallet-id, operation-id: operation-id }
+      { 
+        operation-type: "withdrawal",
+        target-amount: amount,
+        approvals: (list tx-sender),
+        created-at: stacks-block-height
+      }
+    )
+    
+    (var-set next-operation-id (+ operation-id u1))
+    (ok operation-id)
+  )
+)
+
+(define-public (approve-operation (wallet-id uint) (operation-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (operation (unwrap! (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id }) err-not-found))
+    (current-approvals (get approvals operation))
+  )
+    (asserts! (get is-multisig wallet) err-unauthorized)
+    (asserts! (or (is-eq (get owner wallet) tx-sender) (is-co-owner wallet-id tx-sender)) err-unauthorized)
+    (asserts! (is-none (index-of current-approvals tx-sender)) err-already-approved)
+    
+    (let (
+      (updated-approvals (unwrap! (as-max-len? (append current-approvals tx-sender) u20) err-invalid-threshold))
+    )
+      (map-set pending-approvals
+        { wallet-id: wallet-id, operation-id: operation-id }
+        (merge operation { approvals: updated-approvals })
+      )
+      
+      (ok (len updated-approvals))
+    )
+  )
+)
+
+(define-public (execute-multisig-withdrawal (wallet-id uint) (operation-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (operation (unwrap! (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id }) err-not-found))
+    (current-height stacks-block-height)
+    (approval-count (len (get approvals operation)))
+    (withdrawal-amount (get target-amount operation))
+  )
+    (asserts! (get is-multisig wallet) err-unauthorized)
+    (asserts! (>= current-height (get unlock-height wallet)) err-still-locked)
+    (asserts! (>= approval-count (get approval-threshold wallet)) err-insufficient-approvals)
+    (asserts! (>= (get balance wallet) withdrawal-amount) err-insufficient-balance)
+    (asserts! (is-eq (get operation-type operation) "withdrawal") err-unauthorized)
+    
+    (try! (as-contract (stx-transfer? withdrawal-amount tx-sender tx-sender)))
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { 
+        balance: (- (get balance wallet) withdrawal-amount),
+        last-activity: current-height
+      })
+    )
+    
+    (map-delete pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
+    
+    (ok withdrawal-amount)
+  )
+)
+
 (define-public (delete-empty-wallet (wallet-id uint))
   (let (
     (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
@@ -372,6 +562,51 @@
           (>= inactivity-period (get recovery-delay wallet))
           (is-none (map-get? recovery-requests { wallet-id: wallet-id }))
         )
+      )
+    false
+  )
+)
+
+(define-read-only (get-co-owner-info (wallet-id uint) (owner principal))
+  (map-get? wallet-co-owners { wallet-id: wallet-id, owner: owner })
+)
+
+(define-read-only (get-pending-operation (wallet-id uint) (operation-id uint))
+  (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
+)
+
+(define-read-only (is-co-owner (wallet-id uint) (user principal))
+  (match (map-get? wallet-co-owners { wallet-id: wallet-id, owner: user })
+    co-owner-info (get is-active co-owner-info)
+    false
+  )
+)
+
+(define-read-only (get-approval-count (wallet-id uint) (operation-id uint))
+  (match (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
+    operation (len (get approvals operation))
+    u0
+  )
+)
+
+(define-read-only (has-approved (wallet-id uint) (operation-id uint) (user principal))
+  (match (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
+    operation (is-some (index-of (get approvals operation) user))
+    false
+  )
+)
+
+(define-read-only (can-execute-operation (wallet-id uint) (operation-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (match (map-get? pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
+        operation 
+          (and 
+            (get is-multisig wallet)
+            (>= (len (get approvals operation)) (get approval-threshold wallet))
+            (>= stacks-block-height (get unlock-height wallet))
+          )
+        false
       )
     false
   )
