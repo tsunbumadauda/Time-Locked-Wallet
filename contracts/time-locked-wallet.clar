@@ -16,6 +16,10 @@
 (define-constant err-not-co-owner (err u114))
 (define-constant err-invalid-threshold (err u115))
 (define-constant err-cannot-remove-self (err u116))
+(define-constant err-vesting-not-enabled (err u117))
+(define-constant err-cliff-not-reached (err u118))
+(define-constant err-exceeds-vested-amount (err u119))
+(define-constant err-invalid-vesting-duration (err u120))
 
 (define-map wallets
   { wallet-id: uint }
@@ -28,7 +32,12 @@
     recovery-delay: uint,
     is-multisig: bool,
     approval-threshold: uint,
-    total-owners: uint
+    total-owners: uint,
+    has-vesting: bool,
+    vesting-start: uint,
+    vesting-duration: uint,
+    cliff-period: uint,
+    claimed-amount: uint
   }
 )
 
@@ -79,7 +88,12 @@
         recovery-delay: u10080,
         is-multisig: false,
         approval-threshold: u1,
-        total-owners: u1
+        total-owners: u1,
+        has-vesting: false,
+        vesting-start: u0,
+        vesting-duration: u0,
+        cliff-period: u0,
+        claimed-amount: u0
       }
     )
     
@@ -124,13 +138,26 @@
     (asserts! (>= (get balance wallet) amount) err-insufficient-balance)
     (asserts! (> amount u0) err-insufficient-balance)
     
+    (if (get has-vesting wallet)
+      (let (
+        (available-amount (calculate-vested-amount wallet-id))
+        (unclaimed-amount (- available-amount (get claimed-amount wallet)))
+      )
+        (asserts! (>= unclaimed-amount amount) err-exceeds-vested-amount)
+      )
+      true
+    )
+    
     (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
     
     (map-set wallets
       { wallet-id: wallet-id }
       (merge wallet { 
         balance: (- (get balance wallet) amount),
-        last-activity: stacks-block-height
+        last-activity: stacks-block-height,
+        claimed-amount: (if (get has-vesting wallet) 
+          (+ (get claimed-amount wallet) amount) 
+          (get claimed-amount wallet))
       })
     )
     
@@ -310,7 +337,12 @@
         recovery-delay: u10080,
         is-multisig: true,
         approval-threshold: approval-threshold,
-        total-owners: u1
+        total-owners: u1,
+        has-vesting: false,
+        vesting-start: u0,
+        vesting-duration: u0,
+        cliff-period: u0,
+        claimed-amount: u0
       }
     )
     
@@ -454,6 +486,128 @@
     (map-delete pending-approvals { wallet-id: wallet-id, operation-id: operation-id })
     
     (ok withdrawal-amount)
+  )
+)
+
+(define-public (create-vesting-wallet (unlock-height uint) (vesting-duration uint) (cliff-period uint))
+  (let (
+    (wallet-id (var-get next-wallet-id))
+    (current-height stacks-block-height)
+  )
+    (asserts! (> unlock-height current-height) err-invalid-unlock-height)
+    (asserts! (> vesting-duration u0) err-invalid-vesting-duration)
+    (asserts! (<= cliff-period vesting-duration) err-invalid-vesting-duration)
+    (asserts! (is-none (map-get? wallets { wallet-id: wallet-id })) err-already-exists)
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      {
+        owner: tx-sender,
+        balance: u0,
+        unlock-height: unlock-height,
+        created-at: current-height,
+        last-activity: current-height,
+        recovery-delay: u10080,
+        is-multisig: false,
+        approval-threshold: u1,
+        total-owners: u1,
+        has-vesting: true,
+        vesting-start: unlock-height,
+        vesting-duration: vesting-duration,
+        cliff-period: cliff-period,
+        claimed-amount: u0
+      }
+    )
+    
+    (map-set user-wallets
+      { user: tx-sender }
+      { wallet-count: (+ (get-user-wallet-count tx-sender) u1) }
+    )
+    
+    (var-set next-wallet-id (+ wallet-id u1))
+    (ok wallet-id)
+  )
+)
+
+(define-public (claim-vested-amount (wallet-id uint) (amount uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (get has-vesting wallet) err-vesting-not-enabled)
+    (asserts! (>= current-height (+ (get vesting-start wallet) (get cliff-period wallet))) err-cliff-not-reached)
+    (asserts! (> amount u0) err-insufficient-balance)
+    (asserts! (>= (get balance wallet) amount) err-insufficient-balance)
+    
+    (let (
+      (vested-amount (calculate-vested-amount wallet-id))
+      (available-amount (- vested-amount (get claimed-amount wallet)))
+    )
+      (asserts! (>= available-amount amount) err-exceeds-vested-amount)
+      
+      (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+      
+      (map-set wallets
+        { wallet-id: wallet-id }
+        (merge wallet { 
+          balance: (- (get balance wallet) amount),
+          claimed-amount: (+ (get claimed-amount wallet) amount),
+          last-activity: current-height
+        })
+      )
+      
+      (ok amount)
+    )
+  )
+)
+
+(define-public (update-vesting-schedule (wallet-id uint) (new-vesting-duration uint) (new-cliff-period uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (get has-vesting wallet) err-vesting-not-enabled)
+    (asserts! (< current-height (get vesting-start wallet)) err-invalid-vesting-duration)
+    (asserts! (> new-vesting-duration u0) err-invalid-vesting-duration)
+    (asserts! (<= new-cliff-period new-vesting-duration) err-invalid-vesting-duration)
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { 
+        vesting-duration: new-vesting-duration,
+        cliff-period: new-cliff-period,
+        last-activity: current-height
+      })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (disable-vesting (wallet-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (get has-vesting wallet) err-vesting-not-enabled)
+    (asserts! (< current-height (get vesting-start wallet)) err-invalid-vesting-duration)
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { 
+        has-vesting: false,
+        vesting-start: u0,
+        vesting-duration: u0,
+        cliff-period: u0,
+        claimed-amount: u0,
+        last-activity: current-height
+      })
+    )
+    
+    (ok true)
   )
 )
 
@@ -609,6 +763,134 @@
         false
       )
     false
+  )
+)
+
+(define-read-only (calculate-vested-amount (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (let (
+          (current-height stacks-block-height)
+          (vesting-start (get vesting-start wallet))
+          (vesting-duration (get vesting-duration wallet))
+          (cliff-period (get cliff-period wallet))
+          (total-balance (+ (get balance wallet) (get claimed-amount wallet)))
+        )
+          (if (< current-height (+ vesting-start cliff-period))
+            u0
+            (if (>= current-height (+ vesting-start vesting-duration))
+              total-balance
+              (let (
+                (elapsed-time (- current-height vesting-start))
+                (vesting-progress (/ (* elapsed-time u100) vesting-duration))
+              )
+                (/ (* total-balance vesting-progress) u100)
+              )
+            )
+          )
+        )
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (get-vested-info (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (let (
+          (vested-amount (calculate-vested-amount wallet-id))
+          (claimed-amount (get claimed-amount wallet))
+          (available-amount (- vested-amount claimed-amount))
+        )
+          (some { 
+            vested-amount: vested-amount,
+            claimed-amount: claimed-amount,
+            available-amount: available-amount,
+            vesting-start: (get vesting-start wallet),
+            vesting-duration: (get vesting-duration wallet),
+            cliff-period: (get cliff-period wallet)
+          })
+        )
+        none
+      )
+    none
+  )
+)
+
+(define-read-only (get-vesting-progress (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (let (
+          (current-height stacks-block-height)
+          (vesting-start (get vesting-start wallet))
+          (vesting-duration (get vesting-duration wallet))
+        )
+          (if (< current-height vesting-start)
+            u0
+            (if (>= current-height (+ vesting-start vesting-duration))
+              u100
+              (let (
+                (elapsed-time (- current-height vesting-start))
+              )
+                (/ (* elapsed-time u100) vesting-duration)
+              )
+            )
+          )
+        )
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (is-cliff-reached (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (>= stacks-block-height (+ (get vesting-start wallet) (get cliff-period wallet)))
+        true
+      )
+    false
+  )
+)
+
+(define-read-only (blocks-until-cliff (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (let (
+          (cliff-height (+ (get vesting-start wallet) (get cliff-period wallet)))
+        )
+          (if (>= stacks-block-height cliff-height)
+            u0
+            (- cliff-height stacks-block-height)
+          )
+        )
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (blocks-until-fully-vested (wallet-id uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (if (get has-vesting wallet)
+        (let (
+          (vesting-end (+ (get vesting-start wallet) (get vesting-duration wallet)))
+        )
+          (if (>= stacks-block-height vesting-end)
+            u0
+            (- vesting-end stacks-block-height)
+          )
+        )
+        u0
+      )
+    u0
   )
 )
 
