@@ -20,6 +20,11 @@
 (define-constant err-cliff-not-reached (err u118))
 (define-constant err-exceeds-vested-amount (err u119))
 (define-constant err-invalid-vesting-duration (err u120))
+(define-constant err-allowance-exists (err u121))
+(define-constant err-allowance-not-found (err u122))
+(define-constant err-allowance-expired (err u123))
+(define-constant err-exceeds-allowance (err u124))
+(define-constant err-invalid-expiration (err u125))
 
 (define-map wallets
   { wallet-id: uint }
@@ -64,6 +69,11 @@
 (define-map pending-approvals
   { wallet-id: uint, operation-id: uint }
   { operation-type: (string-ascii 20), target-amount: uint, approvals: (list 20 principal), created-at: uint }
+)
+
+(define-map spending-allowances
+  { wallet-id: uint, spender: principal }
+  { amount-limit: uint, spent-amount: uint, expiration-height: uint, created-at: uint }
 )
 
 (define-data-var next-wallet-id uint u1)
@@ -611,6 +621,170 @@
   )
 )
 
+(define-public (grant-allowance (wallet-id uint) (spender principal) (amount-limit uint) (expiration-height uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (> amount-limit u0) err-insufficient-balance)
+    (asserts! (> expiration-height current-height) err-invalid-expiration)
+    (asserts! (is-none (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })) err-allowance-exists)
+    
+    (map-set spending-allowances
+      { wallet-id: wallet-id, spender: spender }
+      { 
+        amount-limit: amount-limit,
+        spent-amount: u0,
+        expiration-height: expiration-height,
+        created-at: current-height
+      }
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: current-height })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (revoke-allowance (wallet-id uint) (spender principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (is-some (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })) err-allowance-not-found)
+    
+    (map-delete spending-allowances { wallet-id: wallet-id, spender: spender })
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: stacks-block-height })
+    )
+    
+    (ok true)
+  )
+)
+
+(define-public (increase-allowance (wallet-id uint) (spender principal) (additional-amount uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (allowance (unwrap! (map-get? spending-allowances { wallet-id: wallet-id, spender: spender }) err-allowance-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (> additional-amount u0) err-insufficient-balance)
+    (asserts! (> (get expiration-height allowance) current-height) err-allowance-expired)
+    
+    (map-set spending-allowances
+      { wallet-id: wallet-id, spender: spender }
+      (merge allowance { amount-limit: (+ (get amount-limit allowance) additional-amount) })
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: current-height })
+    )
+    
+    (ok (+ (get amount-limit allowance) additional-amount))
+  )
+)
+
+(define-public (extend-allowance-expiration (wallet-id uint) (spender principal) (new-expiration-height uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (allowance (unwrap! (map-get? spending-allowances { wallet-id: wallet-id, spender: spender }) err-allowance-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (> new-expiration-height (get expiration-height allowance)) err-invalid-expiration)
+    (asserts! (> new-expiration-height current-height) err-invalid-expiration)
+    
+    (map-set spending-allowances
+      { wallet-id: wallet-id, spender: spender }
+      (merge allowance { expiration-height: new-expiration-height })
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: current-height })
+    )
+    
+    (ok new-expiration-height)
+  )
+)
+
+(define-public (spend-from-allowance (wallet-id uint) (amount uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (allowance (unwrap! (map-get? spending-allowances { wallet-id: wallet-id, spender: tx-sender }) err-allowance-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (> amount u0) err-insufficient-balance)
+    (asserts! (>= (get balance wallet) amount) err-insufficient-balance)
+    (asserts! (>= current-height (get unlock-height wallet)) err-still-locked)
+    (asserts! (> (get expiration-height allowance) current-height) err-allowance-expired)
+    
+    (let (
+      (available-allowance (- (get amount-limit allowance) (get spent-amount allowance)))
+    )
+      (asserts! (>= available-allowance amount) err-exceeds-allowance)
+      
+      (if (get has-vesting wallet)
+        (let (
+          (vested-amount (calculate-vested-amount wallet-id))
+          (unclaimed-amount (- vested-amount (get claimed-amount wallet)))
+        )
+          (asserts! (>= unclaimed-amount amount) err-exceeds-vested-amount)
+        )
+        true
+      )
+      
+      (try! (as-contract (stx-transfer? amount tx-sender tx-sender)))
+      
+      (map-set wallets
+        { wallet-id: wallet-id }
+        (merge wallet { 
+          balance: (- (get balance wallet) amount),
+          claimed-amount: (if (get has-vesting wallet) 
+            (+ (get claimed-amount wallet) amount) 
+            (get claimed-amount wallet))
+        })
+      )
+      
+      (map-set spending-allowances
+        { wallet-id: wallet-id, spender: tx-sender }
+        (merge allowance { spent-amount: (+ (get spent-amount allowance) amount) })
+      )
+      
+      (ok amount)
+    )
+  )
+)
+
+(define-public (reset-allowance-spent (wallet-id uint) (spender principal))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (allowance (unwrap! (map-get? spending-allowances { wallet-id: wallet-id, spender: spender }) err-allowance-not-found))
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    
+    (map-set spending-allowances
+      { wallet-id: wallet-id, spender: spender }
+      (merge allowance { spent-amount: u0 })
+    )
+    
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: stacks-block-height })
+    )
+    
+    (ok true)
+  )
+)
+
 (define-public (delete-empty-wallet (wallet-id uint))
   (let (
     (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
@@ -891,6 +1065,74 @@
         u0
       )
     u0
+  )
+)
+
+(define-read-only (get-allowance (wallet-id uint) (spender principal))
+  (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+)
+
+(define-read-only (get-remaining-allowance (wallet-id uint) (spender principal))
+  (match (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+    allowance 
+      (if (> (get expiration-height allowance) stacks-block-height)
+        (- (get amount-limit allowance) (get spent-amount allowance))
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (is-allowance-active (wallet-id uint) (spender principal))
+  (match (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+    allowance (> (get expiration-height allowance) stacks-block-height)
+    false
+  )
+)
+
+(define-read-only (blocks-until-allowance-expiry (wallet-id uint) (spender principal))
+  (match (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+    allowance 
+      (if (> (get expiration-height allowance) stacks-block-height)
+        (- (get expiration-height allowance) stacks-block-height)
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (get-allowance-usage-percent (wallet-id uint) (spender principal))
+  (match (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+    allowance 
+      (if (> (get amount-limit allowance) u0)
+        (/ (* (get spent-amount allowance) u100) (get amount-limit allowance))
+        u0
+      )
+    u0
+  )
+)
+
+(define-read-only (can-spend-from-allowance (wallet-id uint) (spender principal) (amount uint))
+  (match (map-get? wallets { wallet-id: wallet-id })
+    wallet 
+      (match (map-get? spending-allowances { wallet-id: wallet-id, spender: spender })
+        allowance 
+          (let (
+            (available-allowance (- (get amount-limit allowance) (get spent-amount allowance)))
+            (is-unlocked (>= stacks-block-height (get unlock-height wallet)))
+            (is-not-expired (> (get expiration-height allowance) stacks-block-height))
+            (has-sufficient-balance (>= (get balance wallet) amount))
+          )
+            (and 
+              is-unlocked
+              is-not-expired
+              has-sufficient-balance
+              (>= available-allowance amount)
+            )
+          )
+        false
+      )
+    false
   )
 )
 
