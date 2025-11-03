@@ -26,6 +26,12 @@
 (define-constant err-exceeds-allowance (err u124))
 (define-constant err-invalid-expiration (err u125))
 
+(define-constant err-transfer-exists (err u126))
+(define-constant err-transfer-not-found (err u127))
+(define-constant err-transfer-not-ready (err u128))
+(define-constant err-invalid-new-owner (err u129))
+(define-constant err-invalid-activation (err u130))
+
 (define-map wallets
   { wallet-id: uint }
   {
@@ -74,6 +80,11 @@
 (define-map spending-allowances
   { wallet-id: uint, spender: principal }
   { amount-limit: uint, spent-amount: uint, expiration-height: uint, created-at: uint }
+)
+
+(define-map ownership-transfers
+  { wallet-id: uint }
+  { new-owner: principal, activation-height: uint, proposed-at: uint }
 )
 
 (define-data-var next-wallet-id uint u1)
@@ -1140,5 +1151,69 @@
   (match (map-get? wallets { wallet-id: wallet-id })
     wallet (is-eq (get owner wallet) user)
     false
+  )
+)
+
+(define-public (propose-ownership-transfer (wallet-id uint) (new-owner principal) (activation-height uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (not (is-eq new-owner tx-sender)) err-invalid-new-owner)
+    (asserts! (> activation-height current-height) err-invalid-activation)
+    (asserts! (is-none (map-get? ownership-transfers { wallet-id: wallet-id })) err-transfer-exists)
+    (map-set ownership-transfers
+      { wallet-id: wallet-id }
+      { new-owner: new-owner, activation-height: activation-height, proposed-at: current-height }
+    )
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: current-height })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-ownership-transfer (wallet-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (current-height stacks-block-height)
+  )
+    (asserts! (is-eq (get owner wallet) tx-sender) err-unauthorized)
+    (asserts! (is-some (map-get? ownership-transfers { wallet-id: wallet-id })) err-transfer-not-found)
+    (map-delete ownership-transfers { wallet-id: wallet-id })
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { last-activity: current-height })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-ownership (wallet-id uint))
+  (let (
+    (wallet (unwrap! (map-get? wallets { wallet-id: wallet-id }) err-not-found))
+    (transfer (unwrap! (map-get? ownership-transfers { wallet-id: wallet-id }) err-transfer-not-found))
+    (current-height stacks-block-height)
+    (old-owner (get owner wallet))
+    (new-owner (get new-owner transfer))
+  )
+    (asserts! (is-eq tx-sender new-owner) err-unauthorized)
+    (asserts! (>= current-height (get activation-height transfer)) err-transfer-not-ready)
+    (map-set wallets
+      { wallet-id: wallet-id }
+      (merge wallet { owner: new-owner, last-activity: current-height })
+    )
+    (map-set user-wallets
+      { user: old-owner }
+      { wallet-count: (- (get-user-wallet-count old-owner) u1) }
+    )
+    (map-set user-wallets
+      { user: new-owner }
+      { wallet-count: (+ (get-user-wallet-count new-owner) u1) }
+    )
+    (map-delete ownership-transfers { wallet-id: wallet-id })
+    (ok true)
   )
 )
